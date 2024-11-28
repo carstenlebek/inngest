@@ -4,12 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/inngest/inngest/pkg/config/registration"
-	"github.com/inngest/inngest/pkg/connect"
-	pubsub2 "github.com/inngest/inngest/pkg/connect/pubsub"
-	connstate "github.com/inngest/inngest/pkg/connect/state"
-	"github.com/inngest/inngest/pkg/enums"
-	connectproto "github.com/inngest/inngest/proto/gen/connect/v1"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
@@ -24,10 +18,15 @@ import (
 	"github.com/inngest/inngest/pkg/backoff"
 	"github.com/inngest/inngest/pkg/config"
 	_ "github.com/inngest/inngest/pkg/config/defaults"
+	"github.com/inngest/inngest/pkg/config/registration"
+	"github.com/inngest/inngest/pkg/connect"
+	pubsub2 "github.com/inngest/inngest/pkg/connect/pubsub"
+	connstate "github.com/inngest/inngest/pkg/connect/state"
 	"github.com/inngest/inngest/pkg/consts"
 	"github.com/inngest/inngest/pkg/coreapi"
 	"github.com/inngest/inngest/pkg/cqrs/sqlitecqrs"
 	"github.com/inngest/inngest/pkg/deploy"
+	"github.com/inngest/inngest/pkg/enums"
 	"github.com/inngest/inngest/pkg/event"
 	"github.com/inngest/inngest/pkg/execution"
 	"github.com/inngest/inngest/pkg/execution/batch"
@@ -51,6 +50,7 @@ import (
 	"github.com/inngest/inngest/pkg/service"
 	itrace "github.com/inngest/inngest/pkg/telemetry/trace"
 	"github.com/inngest/inngest/pkg/util/awsgateway"
+	connectproto "github.com/inngest/inngest/proto/gen/connect/v1"
 	"github.com/redis/rueidis"
 	"go.opentelemetry.io/otel/propagation"
 	"golang.org/x/sync/errgroup"
@@ -264,16 +264,13 @@ func start(ctx context.Context, opts StartOpts) error {
 	batcher := batch.NewRedisBatchManager(shardedClient.Batch(), rq)
 	debouncer := debounce.NewRedisDebouncer(unshardedClient.Debounce(), queueShard, rq)
 
-	gatewayProxy := pubsub2.NewRedisPubSubConnector(connectRc)
-	connectionManager := connstate.NewRedisConnectionStateManager(connectRc)
+	connectPubSubRedis := createConnectPubSubRedis()
+	gatewayProxy, err := pubsub2.NewConnector(ctx, pubsub2.WithRedis(connectPubSubRedis, logger.StdlibLoggerWithCustomVarName(ctx, "CONNECT_PUBSUB_LOG_LEVEL"), true))
+	if err != nil {
+		return fmt.Errorf("failed to create connect pubsub connector: %w", err)
+	}
 
-	go func() {
-		// set up PubSub manager, this is required for connect to work
-		err := gatewayProxy.Wait(ctx)
-		if err != nil {
-			logger.From(ctx).Error().Err(err).Msg("error waiting for pubsub messages")
-		}
-	}()
+	connectionManager := connstate.NewRedisConnectionStateManager(connectRc)
 
 	// Create a new expression aggregator, using Redis to load evaluables.
 	agg := expressions.NewAggregator(ctx, 100, 100, sm.(expressions.EvaluableLoader), nil)
@@ -340,6 +337,7 @@ func start(ctx context.Context, opts StartOpts) error {
 		executor.WithBatcher(batcher),
 		executor.WithAssignedQueueShard(queueShard),
 		executor.WithShardSelector(shardSelector),
+		executor.WithTraceReader(dbcqrs),
 	)
 	if err != nil {
 		return err
@@ -415,7 +413,7 @@ func start(ctx context.Context, opts StartOpts) error {
 		return err
 	}
 
-	connectSvc, connectHandler := connect.NewConnectGatewayService(
+	connGateway, connRouter, connectHandler := connect.NewConnectGatewayService(
 		connect.WithConnectionStateManager(connectionManager),
 		connect.WithRequestReceiver(gatewayProxy),
 		connect.WithGatewayAuthHandler(func(ctx context.Context, data *connectproto.WorkerConnectRequestData) (*connect.AuthResponse, error) {
@@ -424,7 +422,7 @@ func start(ctx context.Context, opts StartOpts) error {
 				EnvID:     consts.DevServerEnvId,
 			}, nil
 		}),
-		connect.WithDB(dbcqrs),
+		connect.WithAppLoader(dbcqrs),
 		connect.WithDev(),
 	)
 
@@ -446,7 +444,7 @@ func start(ctx context.Context, opts StartOpts) error {
 	})
 
 	svcs := []service.Service{ds, runner, executorSvc, ds.Apiservice}
-	svcs = append(svcs, connectSvc...)
+	svcs = append(svcs, connGateway, connRouter)
 	return service.StartAll(ctx, svcs...)
 }
 
@@ -474,6 +472,15 @@ func createInmemoryRedis(ctx context.Context, tick time.Duration) (rueidis.Clien
 		}
 	}()
 	return rc, nil
+}
+
+func createConnectPubSubRedis() rueidis.ClientOption {
+	r := miniredis.NewMiniRedis()
+	_ = r.Start()
+	return rueidis.ClientOption{
+		InitAddress:  []string{r.Addr()},
+		DisableCache: true,
+	}
 }
 
 func getSendingEventHandler(ctx context.Context, pb pubsub.Publisher, topic string) execution.HandleSendingEvent {

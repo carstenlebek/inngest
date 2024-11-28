@@ -1,24 +1,15 @@
 'use client';
 
 import { useMemo } from 'react';
+import { ContextualBanner } from '@inngest/components/Banner';
 import { NewButton } from '@inngest/components/Button';
 
+import { type EntitlementUsage } from '@/gql/graphql';
 import { pathCreator } from '@/utils/urls';
-import { Banner } from '../Banner';
 import { useBooleanLocalStorage } from './localStorage';
 import { parseEntitlementUsage } from './parse';
 
-type Props = {
-  entitlementUsage: {
-    runCount: {
-      current: number;
-      limit: number | null;
-    };
-    accountConcurrencyLimitHits: number;
-  };
-};
-
-export function BillingBannerView({ entitlementUsage }: Props) {
+export function BillingBannerView({ entitlementUsage }: { entitlementUsage: EntitlementUsage }) {
   const { bannerMessage, bannerSeverity, items } = parseEntitlementUsage(entitlementUsage);
 
   const isVisible = useBooleanLocalStorage('BillingBanner:visible', true);
@@ -49,26 +40,29 @@ export function BillingBannerView({ entitlementUsage }: Props) {
   }
 
   return (
-    <Banner className="flex" kind={bannerSeverity} onDismiss={onDismiss}>
+    <ContextualBanner
+      className="flex"
+      severity={bannerSeverity}
+      onDismiss={onDismiss}
+      title={bannerMessage}
+      cta={
+        <NewButton
+          appearance="outlined"
+          href={pathCreator.billing({ tab: 'plans', ref: 'app-billing-banner' })}
+          kind="secondary"
+          label="Upgrade plan"
+        />
+      }
+    >
       <div className="flex grow">
         <div className="grow">
-          {bannerMessage}
-          <ul className="list-none">
+          <ContextualBanner.List>
             {items.map(([k, v]) => (
               <li key={k}>{v}</li>
             ))}
-          </ul>
-        </div>
-
-        <div className="flex items-center">
-          <NewButton
-            appearance="outlined"
-            href={pathCreator.billing()}
-            kind="secondary"
-            label="Upgrade plan"
-          />
+          </ContextualBanner.List>
         </div>
       </div>
-    </Banner>
+    </ContextualBanner>
   );
 }

@@ -24,7 +24,7 @@ import (
 	"github.com/inngest/inngestgo/internal/sdkrequest"
 	"github.com/inngest/inngestgo/internal/types"
 	"github.com/inngest/inngestgo/step"
-	"golang.org/x/exp/slog"
+	"log/slog"
 )
 
 var (
@@ -47,6 +47,8 @@ var (
 		TrustProbe: sdk.TrustProbeV1,
 		Connect:    sdk.ConnectV1,
 	}
+
+	defaultWorkerConcurrency = 1_000
 )
 
 // Register adds the given functions to the default handler for serving.  You must register all
@@ -76,6 +78,22 @@ type HandlerOpts struct {
 	// SigningKeyFallback is the fallback signing key for your app. If nil, this
 	// defaults to os.Getenv("INNGEST_SIGNING_KEY_FALLBACK").
 	SigningKeyFallback *string
+
+	// APIOrigin is the specified host to be used to make API calls
+	APIBaseURL *string
+
+	// EventAPIOrigin is the specified host to be used to send events to
+	EventAPIBaseURL *string
+
+	// ServeOrigin is the host to used for HTTP base function invoking.
+	// It's used to specify the host were the functions are hosted on sync.
+	// e.g. https://example.com
+	ServeOrigin *string
+
+	// ServePath is the path to use for HTTP base function invoking
+	// It's used to specify the path were the functions are hosted on sync.
+	// e.g. /api/inngest
+	ServePath *string
 
 	// Env is the branch environment to deploy to.  If nil, this uses
 	// os.Getenv("INNGEST_ENV").  This only deploys to branches if the
@@ -119,6 +137,10 @@ type HandlerOpts struct {
 	// disallowed.
 	AllowInBandSync *bool
 
+	// WorkerConcurrency defines the number of goroutines available to handle
+	// connnect workloads. Defaults to 1000
+	WorkerConcurrency int
+
 	Dev *bool
 }
 
@@ -145,6 +167,57 @@ func (h HandlerOpts) GetSigningKeyFallback() string {
 		return os.Getenv("INNGEST_SIGNING_KEY_FALLBACK")
 	}
 	return *h.SigningKeyFallback
+}
+
+// GetAPIOrigin returns the host to use for sending API requests
+func (h HandlerOpts) GetAPIBaseURL() string {
+	if h.isDev() {
+		return DevServerURL()
+	}
+
+	if h.APIBaseURL == nil {
+		base := os.Getenv("INNGEST_API_BASE_URL")
+		if base != "" {
+			return base
+		}
+
+		return defaultAPIOrigin
+	}
+
+	return *h.APIBaseURL
+}
+
+// GetEventAPIOrigin returns the host to use for sending events
+func (h HandlerOpts) GetEventAPIBaseURL() string {
+	if h.isDev() {
+		return DevServerURL()
+	}
+
+	if h.EventAPIBaseURL == nil {
+		origin := os.Getenv("INNGEST_EVENT_API_BASE_URL")
+		if origin != "" {
+			return origin
+		}
+		return defaultEventAPIOrigin
+	}
+
+	return *h.EventAPIBaseURL
+}
+
+// GetServeOrigin returns the host used for HTTP based executions
+func (h HandlerOpts) GetServeOrigin() string {
+	if h.ServeOrigin != nil {
+		return *h.ServeOrigin
+	}
+	return ""
+}
+
+// GetServePath returns the path used for HTTP based executions
+func (h HandlerOpts) GetServePath() string {
+	if h.ServePath != nil {
+		return *h.ServePath
+	}
+	return ""
 }
 
 // GetEnv returns the env defined within HandlerOpts, or the default
@@ -178,6 +251,21 @@ func (h HandlerOpts) IsInBandSyncAllowed() bool {
 	}
 
 	return false
+}
+
+func (h HandlerOpts) GetWorkerConcurrency() int {
+	if h.WorkerConcurrency == 0 {
+		return defaultWorkerConcurrency
+	}
+	return h.WorkerConcurrency
+}
+
+func (h HandlerOpts) isDev() bool {
+	if h.Dev != nil {
+		return *h.Dev
+	}
+
+	return IsDev()
 }
 
 // Handler represents a handler which serves the Inngest API via HTTP.  This provides
@@ -225,8 +313,6 @@ type handler struct {
 	funcs   []ServableFunction
 	// lock prevents reading the function maps while serving
 	l sync.RWMutex
-
-	useConnect bool
 }
 
 func (h *handler) SetOptions(opts HandlerOpts) Handler {
@@ -528,7 +614,7 @@ func (h *handler) outOfBandSync(w http.ResponseWriter, r *http.Request) error {
 	config := sdk.RegisterRequest{
 		URL:        fmt.Sprintf("%s://%s%s", scheme, host, pathAndParams),
 		V:          "1",
-		DeployType: "ping",
+		DeployType: sdk.DeployTypePing,
 		SDK:        HeaderValueSDK,
 		AppName:    h.appName,
 		Headers: sdk.Headers{
@@ -536,7 +622,6 @@ func (h *handler) outOfBandSync(w http.ResponseWriter, r *http.Request) error {
 			Platform: platform(),
 		},
 		Capabilities: capabilities,
-		UseConnect:   h.useConnect,
 	}
 
 	fns, err := createFunctionConfigs(h.appName, h.funcs, *h.url(r), false)
@@ -624,14 +709,6 @@ func (h *handler) url(r *http.Request) *url.URL {
 	return u
 }
 
-func (h *handler) isDev() bool {
-	if h.Dev != nil {
-		return *h.Dev
-	}
-
-	return IsDev()
-}
-
 func createFunctionConfigs(
 	appName string,
 	fns []ServableFunction,
@@ -670,7 +747,7 @@ func createFunctionConfigs(
 			Triggers:    inngest.MultipleTriggers{},
 			RateLimit:   fn.Config().GetRateLimit(),
 			Cancel:      fn.Config().Cancel,
-			Timeouts:    (*inngest.Timeouts)(fn.Config().Timeouts),
+			Timeouts:    fn.Config().GetTimeouts(),
 			Throttle:    (*inngest.Throttle)(fn.Config().Throttle),
 			Steps: map[string]sdk.SDKStep{
 				"step": {

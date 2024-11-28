@@ -200,7 +200,7 @@ type Timeouts struct {
 	// this is inclusive of time between retries.
 	//
 	// A function may exceed this duration because of concurrency limits, throttling, etc.
-	Start time.Duration `json:"start"`
+	Start *string `json:"start,omitempty"`
 
 	// Finish represents the time between a function starting and the function finishing.
 	// If a function takes longer than this time to finish, the function is marked as cancelled.
@@ -209,7 +209,27 @@ type Timeouts struct {
 	//
 	// Note that if the final request to a function begins before this timeout, and completes
 	// after this timeout, the function will succeed.
-	Finish time.Duration `json:"finish"`
+	Finish *string `json:"finish,omitempty"`
+}
+
+func (t Timeouts) StartDuration() *time.Duration {
+	if t.Start == nil || *t.Start == "" {
+		return nil
+	}
+	if dur, err := str2duration.ParseDuration(*t.Start); err == nil {
+		return &dur
+	}
+	return nil
+}
+
+func (t Timeouts) FinishDuration() *time.Duration {
+	if t.Finish == nil || *t.Finish == "" {
+		return nil
+	}
+	if dur, err := str2duration.ParseDuration(*t.Finish); err == nil {
+		return &dur
+	}
+	return nil
 }
 
 type Priority struct {
@@ -275,7 +295,7 @@ func (f Function) IsBatchEnabled() bool {
 }
 
 // Validate returns an error if the function definition is invalid.
-func (f Function) Validate(ctx context.Context, isConnect bool) error {
+func (f Function) Validate(ctx context.Context) error {
 	var err error
 	if f.Name == "" {
 		err = multierror.Append(err, fmt.Errorf("A function name is required"))
@@ -324,14 +344,10 @@ func (f Function) Validate(ctx context.Context, isConnect bool) error {
 			err = multierror.Append(err, fmt.Errorf("Steps must have a valid URI"))
 		}
 		switch uri.Scheme {
-		case "http", "https":
+		case "http", "https", "ws", "wss":
 			continue
-		case "ws", "wss":
-			if !isConnect {
-				err = multierror.Append(err, fmt.Errorf("Non-HTTP steps are not yet supported"))
-			}
 		default:
-			err = multierror.Append(err, fmt.Errorf("Non-HTTP steps are not yet supported"))
+			err = multierror.Append(err, fmt.Errorf("Non-supported step schema: %s", uri.Scheme))
 		}
 	}
 

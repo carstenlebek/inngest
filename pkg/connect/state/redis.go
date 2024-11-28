@@ -5,6 +5,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"io/fs"
 	"log/slog"
 	"regexp"
@@ -23,6 +24,12 @@ var embedded embed.FS
 var (
 	scripts = map[string]*rueidis.Lua{}
 	include = regexp.MustCompile(`-- \$include\(([\w.]+)\)`)
+)
+
+var (
+	ConnDeletedWithGroupErr = fmt.Errorf("group deleted with conn")
+	WorkerGroupNotFoundErr  = fmt.Errorf("worker group not found")
+	GatewayNotFoundErr      = fmt.Errorf("gateway not found")
 )
 
 func init() {
@@ -101,7 +108,7 @@ func (r redisConnectionStateManager) SetRequestIdempotency(ctx context.Context, 
 }
 
 func (r *redisConnectionStateManager) GetConnectionsByEnvID(ctx context.Context, envID uuid.UUID) ([]*connpb.ConnMetadata, error) {
-	key := r.connKey(envID.String())
+	key := r.connKey(envID)
 	cmd := r.client.B().Hvals().Key(key).Build()
 
 	res, err := r.client.Do(ctx, cmd).AsStrSlice()
@@ -121,26 +128,93 @@ func (r *redisConnectionStateManager) GetConnectionsByEnvID(ctx context.Context,
 	return conns, nil
 }
 
-func (r *redisConnectionStateManager) GetConnectionsByAppID(ctx context.Context, appID uuid.UUID) ([]*connpb.ConnMetadata, error) {
-	return nil, notImplementedError
+func (r *redisConnectionStateManager) GetConnectionsByAppID(ctx context.Context, envId uuid.UUID, appID uuid.UUID) ([]*connpb.ConnMetadata, error) {
+	key := r.connIndexByApp(envId, &appID)
+
+	connIds, err := r.client.Do(ctx, r.client.B().Smembers().Key(key).Build()).AsStrSlice()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(connIds) == 0 {
+		return nil, nil
+	}
+
+	res, err := r.client.Do(ctx, r.client.B().Hmget().Key(r.connKey(envId)).Field(connIds...).Build()).AsStrSlice()
+	if err != nil {
+		return nil, err
+	}
+
+	conns := []*connpb.ConnMetadata{}
+	for _, meta := range res {
+		var conn connpb.ConnMetadata
+		if err := json.Unmarshal([]byte(meta), &conn); err != nil {
+			return nil, err
+		}
+		conns = append(conns, &conn)
+	}
+
+	return conns, nil
 }
 
-func (r *redisConnectionStateManager) AddConnection(ctx context.Context, conn *Connection) error {
-	envID := conn.Data.AuthData.GetEnvId()
+func (r *redisConnectionStateManager) GetConnectionsByGroupID(ctx context.Context, envID uuid.UUID, groupID string) ([]*connpb.ConnMetadata, error) {
+	keys := []string{
+		r.connKey(envID),
+		r.groupIDKey(envID, groupID),
+	}
+	args := []string{}
 
-	// groupID := data.SessionDetails.FunctionHash
+	res, err := scripts["get_conns_by_group"].Exec(
+		ctx,
+		r.client,
+		keys,
+		args,
+	).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("error retrieving conns by group: %w", err)
+	}
+
+	conns := []*connpb.ConnMetadata{}
+	for _, cs := range res {
+		var conn connpb.ConnMetadata
+		if err := json.Unmarshal([]byte(cs), &conn); err != nil {
+			return nil, fmt.Errorf("error deserializing conn metadata: %w", err)
+		}
+		conns = append(conns, &conn)
+	}
+
+	return conns, nil
+}
+
+func (r *redisConnectionStateManager) UpsertConnection(ctx context.Context, conn *Connection) error {
+	envID, err := uuid.Parse(conn.Data.AuthData.GetEnvId())
+	if err != nil {
+		return fmt.Errorf("error parsing environment ID: %w", err)
+	}
+
 	groupID := conn.Group.Hash
 	meta := &connpb.ConnMetadata{
-		Language: conn.Data.SdkLanguage,
-		Version:  conn.Data.SdkVersion,
-		EnvId:    envID,
-		GroupId:  groupID,
-		Session:  conn.Session,
+		Id:              conn.Session.SessionId.ConnectionId,
+		InstanceId:      conn.Session.SessionId.InstanceId,
+		Status:          conn.Status,
+		Language:        conn.Data.SdkLanguage,
+		Version:         conn.Data.SdkVersion,
+		GroupId:         groupID,
+		Attributes:      conn.Data.SystemAttributes,
+		GatewayId:       conn.GatewayId,
+		LastHeartbeatAt: timestamppb.New(time.Now()),
+	}
+
+	isHealthy := "0"
+	if conn.Status == connpb.ConnectionStatus_READY {
+		isHealthy = "1"
 	}
 
 	keys := []string{
 		r.connKey(envID),
 		r.groupKey(envID),
+		r.groupIDKey(envID, groupID),
+		r.connIndexByApp(envID, conn.Group.AppID),
 	}
 
 	// NOTE: redis_state.StrSlice format the data in a non JSON way, not sure why
@@ -162,13 +236,14 @@ func (r *redisConnectionStateManager) AddConnection(ctx context.Context, conn *C
 	}
 
 	args := []string{
-		conn.Session.SessionId.ConnectionId,
+		meta.Id,
 		metaArg,
 		groupID,
 		groupArg,
+		isHealthy,
 	}
 
-	status, err := scripts["add_conn"].Exec(
+	status, err := scripts["upsert_conn"].Exec(
 		ctx,
 		r.client,
 		keys,
@@ -187,16 +262,50 @@ func (r *redisConnectionStateManager) AddConnection(ctx context.Context, conn *C
 	}
 }
 
-func (r *redisConnectionStateManager) DeleteConnection(ctx context.Context, connID string) error {
-	return notImplementedError
+func (r *redisConnectionStateManager) DeleteConnection(ctx context.Context, envID uuid.UUID, appID *uuid.UUID, groupID string, connId string) error {
+	keys := []string{
+		r.connKey(envID),
+		r.groupKey(envID),
+		r.groupIDKey(envID, groupID),
+		r.connIndexByApp(envID, appID),
+	}
+
+	args := []string{
+		connId,
+		groupID,
+	}
+
+	status, err := scripts["delete_conn"].Exec(
+		ctx,
+		r.client,
+		keys,
+		args,
+	).AsInt64()
+	if err != nil {
+		return fmt.Errorf("error deleting connection: %w", err)
+	}
+
+	switch status {
+	case 0:
+		return nil
+
+	case 1:
+		return ConnDeletedWithGroupErr
+
+	default:
+		return fmt.Errorf("unknow status when deleting connection: %w", err)
+	}
 }
 
 func (r *redisConnectionStateManager) GetWorkerGroupByHash(ctx context.Context, envID uuid.UUID, hash string) (*WorkerGroup, error) {
-	key := r.groupKey(envID.String())
+	key := r.groupKey(envID)
 	cmd := r.client.B().Hget().Key(key).Field(hash).Build()
 
 	byt, err := r.client.Do(ctx, cmd).AsBytes()
 	if err != nil {
+		if rueidis.IsRedisNil(err) {
+			return nil, WorkerGroupNotFoundErr
+		}
 		return nil, fmt.Errorf("error retrieving worker group: %w", err)
 	}
 
@@ -214,7 +323,7 @@ func (r *redisConnectionStateManager) UpdateWorkerGroup(ctx context.Context, env
 		return fmt.Errorf("error serializing worker group for update: %w", err)
 	}
 
-	key := r.groupKey(envID.String())
+	key := r.groupKey(envID)
 	cmd := r.client.B().Hset().Key(key).FieldValue().FieldValue(group.Hash, string(byt)).Build()
 
 	if err := r.client.Do(ctx, cmd).Error(); err != nil {
@@ -224,10 +333,80 @@ func (r *redisConnectionStateManager) UpdateWorkerGroup(ctx context.Context, env
 	return nil
 }
 
-func (r *redisConnectionStateManager) connKey(envID string) string {
+func (r *redisConnectionStateManager) connKey(envID uuid.UUID) string {
 	return fmt.Sprintf("{%s}:conns", envID)
 }
 
-func (r *redisConnectionStateManager) groupKey(envID string) string {
-	return fmt.Sprintf("{%s}:groups", envID)
+func (r *redisConnectionStateManager) connIndexByApp(envID uuid.UUID, appId *uuid.UUID) string {
+	// For the initial connection upsert, the app won't be synced just yet, so we cannot update this index.
+	// We still need to provide a key with the same slot, otherwise Redis will complain
+	if appId == nil || *appId == uuid.Nil {
+		return fmt.Sprintf("{%s}:index_disabled", envID.String())
+	}
+	return fmt.Sprintf("{%s}:conns_appid:%s", envID.String(), appId.String())
+}
+
+func (r *redisConnectionStateManager) groupKey(envID uuid.UUID) string {
+	return fmt.Sprintf("{%s}:groups", envID.String())
+}
+
+func (r *redisConnectionStateManager) groupIDKey(envID uuid.UUID, groupID string) string {
+	return fmt.Sprintf("{%s}:groups:%s", envID.String(), groupID)
+}
+
+// gatewaysHashKey returns the key for the global gateways hash.
+// Gateways are not scoped to any environment, so the Redis hash tag will be global.
+// This also means that gateways cannot be accessed in the same script as other environment-scoped keys.
+func (r *redisConnectionStateManager) gatewaysHashKey() string {
+	return "{connect}:gateways"
+}
+
+func (r *redisConnectionStateManager) UpsertGateway(ctx context.Context, gateway *Gateway) error {
+	marshaled, err := json.Marshal(gateway)
+	if err != nil {
+		return fmt.Errorf("could not marshal gateway state: %w", err)
+	}
+
+	res := r.client.Do(
+		ctx,
+		r.client.B().Hset().Key(r.gatewaysHashKey()).FieldValue().FieldValue(gateway.Id, string(marshaled)).Build(),
+	)
+	if err := res.Error(); err != nil {
+		return fmt.Errorf("could not set gateway state: %w", err)
+	}
+
+	return nil
+}
+
+func (r *redisConnectionStateManager) DeleteGateway(ctx context.Context, gatewayId string) error {
+	res := r.client.Do(
+		ctx,
+		r.client.B().Hdel().Key(r.gatewaysHashKey()).Field(gatewayId).Build(),
+	)
+	if err := res.Error(); err != nil {
+		return fmt.Errorf("could not delete gateway state: %w", err)
+	}
+
+	return nil
+}
+
+func (r *redisConnectionStateManager) GetGateway(ctx context.Context, gatewayId string) (*Gateway, error) {
+	gatewayBytes, err := r.client.Do(
+		ctx,
+		r.client.B().Hget().Key(r.gatewaysHashKey()).Field(gatewayId).Build(),
+	).AsBytes()
+	if err != nil {
+		if rueidis.IsRedisNil(err) {
+			return nil, GatewayNotFoundErr
+		}
+
+		return nil, fmt.Errorf("could not get gateway state: %w", err)
+	}
+
+	var gateway Gateway
+	if err := json.Unmarshal(gatewayBytes, &gateway); err != nil {
+		return nil, fmt.Errorf("could not unmarshal gateway state: %w", err)
+	}
+
+	return &gateway, nil
 }
